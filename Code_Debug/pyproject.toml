@@ -1,0 +1,8 @@
+[project]
+name = "code-bug-fix-agent"
+version = "0.1.0"
+description = "Static analysis and test orchestration for Python, SQL, and Java source code"
+requires-python = ">=3.10"
+
+[project.scripts]
+code-bug-fix-agent = "bug_fix_agent:main"
