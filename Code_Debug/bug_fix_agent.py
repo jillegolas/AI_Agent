@@ -12,6 +12,7 @@ import argparse
 import ast
 import importlib.util
 import json
+import operator
 import re
 import shutil
 import subprocess
@@ -90,7 +91,7 @@ class PythonAdapter(LanguageAdapter):
                     if isinstance(default, (ast.List, ast.Dict, ast.Set)):
                         findings.append(Finding(
                             "mutable-default", "error",
-                            "Mutable default argument persists between calls.",
+                            "Mutable default argument persists between calls; use None and initialize inside the function.",
                             str(path), node.lineno, node.col_offset, False,
                         ))
             elif isinstance(node, ast.ExceptHandler) and node.type is None:
@@ -122,19 +123,81 @@ class PythonAdapter(LanguageAdapter):
         source = path.read_text(encoding="utf-8")
         lines = source.splitlines(keepends=True)
         changed = 0
-        for finding in findings:
-            if finding.rule != "identity-comparison" or not finding.fixable:
+        tree = ast.parse(source, filename=str(path))
+        needs_safe_expression_helper = any(item.rule == "dynamic-eval" for item in findings)
+        functions = {
+            node.lineno: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for finding in sorted(findings, key=lambda item: item.line, reverse=True):
+            if not finding.fixable and finding.rule not in {"mutable-default", "bare-except", "assert-for-validation", "dynamic-eval"}:
                 continue
             index = finding.line - 1
             if index < 0 or index >= len(lines):
                 continue
-            updated = re.sub(r"(?<![=!<>])\bis\s+not\b(?!\s+None\b)", "!=", lines[index])
-            updated = re.sub(r"(?<![=!<>])\bis\b(?!\s+None\b)", "==", updated)
-            if updated != lines[index]:
-                lines[index] = updated
-                finding.fixed = True
-                changed += 1
+            updated = lines[index]
+            if finding.rule == "identity-comparison":
+                updated = re.sub(r"(?<![=!<>])\bis\s+not\b(?!\s+None\b)", "!=", updated)
+                updated = re.sub(r"(?<![=!<>])\bis\b(?!\s+None\b)", "==", updated)
+                if updated != lines[index]:
+                    lines[index] = updated
+                    finding.fixed = True
+                    changed += 1
+            elif finding.rule == "bare-except":
+                updated = re.sub(r"except\s*:", "except Exception:", updated, count=1)
+                if updated != lines[index]:
+                    lines[index] = updated
+                    finding.fixed = True
+                    changed += 1
+            elif finding.rule == "assert-for-validation":
+                match = re.match(r"^(\s*)assert\s+(.+?)(\s*(?:#.*)?\r?\n)?$", updated)
+                if match:
+                    indent, condition, newline = match.groups()
+                    newline = newline or "\n"
+                    lines[index] = f"{indent}if not ({condition}):{newline}"
+                    lines.insert(index + 1, f'{indent}    raise ValueError("validation failed")' + newline)
+                    finding.fixed = True
+                    changed += 1
+            elif finding.rule == "dynamic-eval":
+                updated = re.sub(
+                    r"\beval\(([^()]*)\)",
+                    r"safe_expression_eval(\1, locals())",
+                    updated,
+                    count=1,
+                )
+                if updated != lines[index]:
+                    lines[index] = updated
+                    finding.fixed = True
+                    changed += 1
+            elif finding.rule == "mutable-default":
+                function = functions.get(finding.line)
+                if function:
+                    for argument, default in zip(
+                        [*function.args.posonlyargs, *function.args.args],
+                        [None] * (len(function.args.posonlyargs) + len(function.args.args) - len(function.args.defaults)) + list(function.args.defaults),
+                    ):
+                        if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                            default_source = ast.get_source_segment(source, default) or "[]"
+                            pattern = rf"(\b{re.escape(argument.arg)}\s*=\s*){re.escape(default_source)}"
+                            replacement, count = re.subn(pattern, rf"\1None", updated, count=1)
+                            if count:
+                                lines[index] = replacement
+                                body_index = function.body[0].lineno - 1 if function.body else index + 1
+                                if function.body and isinstance(function.body[0], ast.Expr) and isinstance(function.body[0].value, ast.Constant) and isinstance(function.body[0].value.value, str):
+                                    body_index += 1
+                                body_indent = " " * (function.body[0].col_offset if function.body else function.col_offset + 4)
+                                lines[body_index:body_index] = [
+                                    f"{body_indent}if {argument.arg} is None:\n",
+                                    f"{body_indent}    {argument.arg} = {default_source}\n",
+                                ]
+                                finding.fixed = True
+                                changed += 1
+                                break
         if changed:
+            if needs_safe_expression_helper and "def safe_expression_eval(" not in "".join(lines):
+                helper = '''\n\n_SAFE_OPERATORS = {\n    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,\n    ast.Div: operator.truediv, ast.Mod: operator.mod, ast.Pow: operator.pow,\n    ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,\n    ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge,\n}\n\n\ndef safe_expression_eval(expression, context):\n    """Evaluate a small, non-executable expression against supplied data."""\n    tree = ast.parse(expression, mode="eval")\n\n    def evaluate(node):\n        if isinstance(node, ast.Expression):\n            return evaluate(node.body)\n        if isinstance(node, ast.Constant):\n            return node.value\n        if isinstance(node, ast.Name) and node.id in context:\n            return context[node.id]\n        if isinstance(node, ast.Subscript):\n            return evaluate(node.value)[evaluate(node.slice)]\n        if isinstance(node, ast.Attribute) and not node.attr.startswith("_"):\n            return getattr(evaluate(node.value), node.attr)\n        if isinstance(node, (ast.List, ast.Tuple, ast.Dict)):\n            if isinstance(node, ast.Dict):\n                return {evaluate(key): evaluate(value) for key, value in zip(node.keys, node.values)}\n            return [evaluate(item) for item in node.elts]\n        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.Not, ast.USub, ast.UAdd)):\n            value = evaluate(node.operand)\n            return not value if isinstance(node.op, ast.Not) else (-value if isinstance(node.op, ast.USub) else value)\n        if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):\n            values = [evaluate(item) for item in node.values]\n            return all(values) if isinstance(node.op, ast.And) else any(values)\n        if isinstance(node, ast.Compare):\n            left = evaluate(node.left)\n            return all(_SAFE_OPERATORS[type(op)](left, evaluate(right)) for op, right in zip(node.ops, node.comparators))\n        if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPERATORS:\n            return _SAFE_OPERATORS[type(node.op)](evaluate(node.left), evaluate(node.right))\n        raise ValueError("Expression contains an unsupported operation")\n\n    return evaluate(tree)\n'''
+                lines.insert(0, "import ast\nimport operator\n" + helper)
             path.write_text("".join(lines), encoding="utf-8")
         return changed
 

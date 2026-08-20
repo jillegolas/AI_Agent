@@ -106,9 +106,11 @@ def field(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def result_items(report: AnalysisReport) -> str:
+def result_items(report: AnalysisReport, revised_code: str, revised_filename: str) -> str:
     errors = [item for item in report.findings if item.severity == "error" and not item.fixed]
     refactors = [item for item in report.findings if item.severity != "error" or item.fixed]
+    tested = bool(report.tests) and all(item.passed for item in report.tests)
+    ready_to_download = not errors and not report.import_errors and tested
     strengths: list[str] = []
     if report.language == "python" and not report.import_errors:
         strengths.append("Python files import successfully.")
@@ -126,6 +128,10 @@ def result_items(report: AnalysisReport) -> str:
         return f'<div class="item {css}"><b>{field(item.rule)} <span class="location">{field(location)}</span></b><p>{field(item.message)}</p></div>'
 
     blocks = [f'<div class="result-head"><div><div class="eyebrow">Review complete</div><h2>{len(report.files)} file(s)</h2></div><span class="badge {"ready" if report.production_ready else ""}">{"Ready" if report.production_ready else "Needs attention"}</span></div>']
+    if ready_to_download:
+        blocks.append(f'<form method="post" action="/download"><input type="hidden" name="filename" value="{field(revised_filename)}"><textarea name="code" hidden>{field(revised_code)}</textarea><button type="submit">Download fixed version</button></form>')
+    else:
+        blocks.append('<div class="item error"><b>Download paused</b><p>The revised code must pass the final scan, import check, and test before it can be downloaded.</p></div>')
     blocks.append(f'<div class="stats"><div class="stat"><b>{len(errors)}</b><span>Potential errors</span></div><div class="stat"><b>{len(refactors)}</b><span>Refactor ideas</span></div><div class="stat"><b>{len(strengths)}</b><span>Strengths</span></div></div>')
     blocks.append('<section><h3>Potential errors</h3>' + (''.join(item_markup(item, "error") for item in errors) or '<div class="item good"><p>No unresolved errors found.</p></div>') + '</section>')
     blocks.append('<section><h3>Refactor opportunities</h3>' + (''.join(item_markup(item) for item in refactors) or '<div class="item good"><p>No refactor suggestions from the current rules.</p></div>') + '</section>')
@@ -178,6 +184,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
         filename = Path(values.get("filename", ["review.py"])[0]).name or "review.py"
         language = values.get("language", ["python"])[0]
         command_text = values.get("test_command", [""])[0].strip()
+        if self.path == "/download":
+            download_name = Path(values.get("filename", ["review_ai_revised.py"])[0]).name or "review_ai_revised.py"
+            download_code = values.get("code", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/x-python; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+            self.end_headers()
+            self.wfile.write(download_code.encode("utf-8"))
+            return
         if not code.strip():
             results = '<div class="item error"><b>Missing source</b><p>Paste code or choose a file before running the review.</p></div>'
         else:
@@ -185,9 +200,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 with tempfile.TemporaryDirectory(prefix="code-review-") as directory:
                     target = Path(directory) / filename
                     target.write_text(code, encoding="utf-8")
-                    command = shlex.split(command_text, posix=False) if command_text else []
-                    report = analyze(str(target), language=language, test_command=command)
-                    results = result_items(report)
+                    command = shlex.split(command_text, posix=False) if command_text else ["python", "-m", "py_compile", filename]
+                    report = analyze(str(target), language=language, apply=True, test_command=command)
+                    revised_code = target.read_text(encoding="utf-8")
+                    revised_filename = f"{Path(filename).stem}_ai_revised.py"
+                    final_report = analyze(str(target), language=language, apply=False, test_command=command)
+                    final_report.applied_fixes = report.applied_fixes
+                    results = result_items(final_report, revised_code, revised_filename)
             except (ValueError, OSError) as exc:
                 results = f'<div class="item error"><b>Review could not run</b><p>{field(str(exc))}</p></div>'
         self.send_response(200)

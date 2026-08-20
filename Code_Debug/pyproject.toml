@@ -6,3 +6,4 @@ requires-python = ">=3.10"
 
 [project.scripts]
 code-bug-fix-agent = "bug_fix_agent:main"
+code-debug-web = "web_app:main"
